@@ -1,0 +1,112 @@
+name: SSH over Tailscale
+# 中文名称: 基于 Tailscale 的 SSH 远程访问
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-ssh:
+    # 更改为 Linux Runner (基于 Debian/Ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 3600
+    
+    steps:
+      - name: 1. 配置核心 SSH 设置
+        run: |
+          # 确保 SSH 服务已运行并监听端口 22
+          sudo apt update
+          sudo apt install -y openssh-server
+          sudo systemctl start ssh
+          sudo systemctl enable ssh
+          
+          # GitHub Actions Runner 默认没有启用 UFW (防火墙)，但 Tailscale 流量通常无需额外防火墙规则。
+          # 如果需要，可以添加 SSH 规则：
+          # sudo ufw allow 22/tcp
+
+      - name: 2. 创建 SSH 用户 (使用 GitHub Secret 密码)
+        # Bash shell 是 Linux 环境的默认 shell
+        shell: bash
+        run: |
+          USERNAME="RDP" # 使用 RDP 作为用户名，与 Windows 版本保持一致
+          PASSWORD_SECRET="${{ secrets.RDP_USER_PASSWORD }}"
+          
+          # 1. 创建用户并设置主目录
+          sudo useradd -m -s /bin/bash $USERNAME
+          
+          # 2. 将用户密码设置为 Secret 中的固定密码
+          # 使用 'chpasswd' 命令安全地设置密码，避免密码暴露
+          echo "$USERNAME:$PASSWORD_SECRET" | sudo chpasswd
+          
+          # 3. 将用户添加到 sudo 组 (等同于管理员权限)
+          sudo usermod -aG sudo $USERNAME
+          
+          echo "SSH 用户 '$USERNAME' 已创建，密码来自 GitHub Secret。"
+          
+          if ! id -u $USERNAME > /dev/null 2>&1; then
+              echo "用户创建失败"
+              exit 1
+          fi
+
+      - name: 3. 安装 Tailscale
+        run: |
+          # 针对 Debian/Ubuntu 系统安装 Tailscale
+          sudo apt update
+          sudo apt install -y curl
+          
+          # 添加 Tailscale 的 GPG 密钥和仓库
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.gpg | sudo gpg --dearmor -o /usr/share/keyrings/tailscale-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu jammy main" | sudo tee /etc/apt/sources.list.d/tailscale.list
+          
+          sudo apt update
+          sudo apt install -y tailscale
+
+      - name: 4. 建立 Tailscale 连接
+        run: |
+          # 启动 Tailscale 服务，并使用 Auth Key 连接到您的 Tailnet
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$GITHUB_RUN_ID
+          
+          # 等待 Tailscale 分配 IP (Linux Bash 循环)
+          TS_IP=""
+          for i in $(seq 1 10); do
+              TS_IP=$(sudo tailscale ip -4)
+              if [ -n "$TS_IP" ]; then
+                  break
+              fi
+              sleep 5
+          done
+          
+          if [ -z "$TS_IP" ]; then
+              echo "Tailscale IP 未分配。退出。"
+              exit 1
+          fi
+          # 将 Tailscale IP 存储到环境变量中
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+      
+      - name: 5. 验证 SSH 可访问性
+        run: |
+          echo "Tailscale IP: $TAILSCALE_IP"
+          
+          # 使用 nc (netcat) 测试 Tailscale IP 上的 SSH 端口 (22) 连通性
+          sudo apt install -y netcat-openbsd
+          if nc -z -w 5 $TAILSCALE_IP 22; then
+              echo "TCP 连接到 SSH 端口 22 成功！"
+          else
+              echo "错误: TCP 连接到 SSH 端口 22 失败"
+              exit 1
+          fi
+
+      - name: 6. 保持连接 (Maintain Connection)
+        run: |
+          echo -e "\n=== SSH 访问信息 ==="
+          echo "协议: SSH (而非 RDP)"
+          echo "地址 (Tailscale IP): $TAILSCALE_IP"
+          echo "用户名: RDP"
+          echo "密码: 请使用您在 GitHub Secrets 中设置的 RDP_USER_PASSWORD。"
+          echo -e "连接命令示例: ssh RDP@$TAILSCALE_IP"
+          echo -e "====================\n"
+          
+          # 通过无限循环保持 runner 活跃
+          while true; do
+              echo "[$(date)] SSH 活跃中 - 在工作流页面手动点击 Cancel 终止"
+              sleep 300
+          done
